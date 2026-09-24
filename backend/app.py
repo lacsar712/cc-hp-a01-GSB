@@ -1,6 +1,6 @@
 import json
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import psycopg
 from fastapi import Depends, FastAPI, HTTPException
@@ -10,7 +10,7 @@ from passlib.context import CryptContext
 from pydantic import BaseModel, Field
 from psycopg.rows import dict_row
 
-from rules import judge
+from rules import aux_batch_error, freeze_aux_batch, judge
 
 SECRET = os.environ.get("JWT_SECRET", "herb-process-dev-secret")
 DSN = os.environ.get("DATABASE_URL", "postgresql://app:app@localhost:54393/herb")
@@ -39,7 +39,18 @@ class StepIn(BaseModel):
 
 class BatchIn(BaseModel):
     herb: str = Field(min_length=1, max_length=80)
+    aux_batch_id: int | None = None
     steps: list[StepIn]
+
+
+class AuxBatchIn(BaseModel):
+    material: str = Field(min_length=1, max_length=80)
+    lot_no: str = Field(min_length=1, max_length=80)
+    expires_on: date
+
+
+class AuxBatchPatchIn(BaseModel):
+    expires_on: date
 
 
 def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(security)) -> dict:
@@ -73,6 +84,16 @@ def startup():
                 doc jsonb NOT NULL,
                 verdict text NOT NULL,
                 reason text NOT NULL,
+                created_by text NOT NULL,
+                created_at timestamptz NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS aux_batches (
+                id serial PRIMARY KEY,
+                material text NOT NULL,
+                lot_no text NOT NULL,
+                expires_on date NOT NULL,
                 created_by text NOT NULL,
                 created_at timestamptz NOT NULL
             )"""
@@ -116,11 +137,67 @@ def list_batches(_user: dict = Depends(current_user)):
     return rows
 
 
+@app.get("/api/aux-batches")
+def list_aux_batches(_user: dict = Depends(current_user)):
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id, material, lot_no, expires_on, created_by FROM aux_batches ORDER BY id DESC"
+        ).fetchall()
+    return rows
+
+
+@app.post("/api/aux-batches", status_code=201)
+def create_aux_batch(body: AuxBatchIn, user: dict = Depends(require_writer)):
+    with connect() as conn:
+        row = conn.execute(
+            """INSERT INTO aux_batches (material, lot_no, expires_on, created_by, created_at)
+               VALUES (%s, %s, %s, %s, %s)
+               RETURNING id, material, lot_no, expires_on, created_by""",
+            (
+                body.material.strip(),
+                body.lot_no.strip(),
+                body.expires_on,
+                user["username"],
+                datetime.now(timezone.utc),
+            ),
+        ).fetchone()
+        conn.commit()
+    return row
+
+
+@app.patch("/api/aux-batches/{aux_id}")
+def patch_aux_batch(aux_id: int, body: AuxBatchPatchIn, _user: dict = Depends(require_writer)):
+    # 只改正册上失效日；batches.doc 里已冻结的批号正文不动。
+    with connect() as conn:
+        row = conn.execute(
+            """UPDATE aux_batches SET expires_on = %s
+               WHERE id = %s
+               RETURNING id, material, lot_no, expires_on, created_by""",
+            (body.expires_on, aux_id),
+        ).fetchone()
+        conn.commit()
+    if row is None:
+        raise HTTPException(status_code=404, detail="批号册中没有这条记录")
+    return row
+
+
 @app.post("/api/batches", status_code=201)
 def create_batch(body: BatchIn, user: dict = Depends(require_writer)):
-    doc = {"steps": [s.model_dump() for s in body.steps]}
-    verdict, reason = judge(doc)
+    if body.aux_batch_id is None:
+        raise HTTPException(status_code=400, detail="缺选辅料批号：写清炒文书必须从批号册点选辅料批号")
     with connect() as conn:
+        aux = conn.execute(
+            "SELECT id, material, lot_no, expires_on FROM aux_batches WHERE id = %s",
+            (body.aux_batch_id,),
+        ).fetchone()
+        problem = aux_batch_error(aux, date.today())
+        if problem:
+            raise HTTPException(status_code=400, detail=problem)
+        doc = {
+            "steps": [s.model_dump() for s in body.steps],
+            "aux_batch": freeze_aux_batch(aux),
+        }
+        verdict, reason = judge(doc)
         row = conn.execute(
             """INSERT INTO batches (herb, doc, verdict, reason, created_by, created_at)
                VALUES (%s, %s::jsonb, %s, %s, %s, %s)
